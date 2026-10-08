@@ -144,7 +144,9 @@ function registerUpdates(bot, channelLink, config = {}) {
     save(next);
     const id = String(msg.chat.id);
     if (!jobs[id]) saveJobs({ ...jobs, [id]: { dueAt: now() + 10 * 60 * 1000, status: 'pending' } });
-    return reply(msg.chat.id, '🔔 Updates ON. Notifications band karne ke liye /stop bhejein.');
+    if (/^\/subscribe(?:@\w+)?(?:\s|$)/.test(msg.text || '')) {
+      return reply(msg.chat.id, '🔔 Updates ON. Notifications band karne ke liye /stop bhejein.');
+    }
   }
   on(/^\/(?:start|subscribe)(?:@\w+)?(?:\s.*)?$/s, subscribe);
   on(/^\/myid(?:@\w+)?\s*$/, msg => reply(msg.chat.id, 'Aapki Telegram user ID: ' + msg.from.id));
