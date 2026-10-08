@@ -59,6 +59,10 @@ function registerUpdates(bot, channelLink, config = {}) {
   let subscribers = new Set();
   let storageReady = false;
   let busy = false;
+  const now = config.now || Date.now;
+  const jobsFile = directory && path.join(directory, 'welcome-updates.json');
+  let jobs = {};
+  let ticking = false;
   const file = directory && path.join(directory, 'subscribers.json');
   if (file) {
     try {
@@ -69,6 +73,12 @@ function registerUpdates(bot, channelLink, config = {}) {
         subscribers = new Set(saved.map(String));
       }
       fs.accessSync(directory, fs.constants.W_OK);
+      if (fs.existsSync(jobsFile)) {
+        jobs = JSON.parse(fs.readFileSync(jobsFile, 'utf8'));
+        if (!jobs || Array.isArray(jobs) || typeof jobs !== 'object' ||
+          Object.entries(jobs).some(([id, job]) => !/^\d+$/.test(id) || !job || !Number.isFinite(job.dueAt) ||
+            !['pending', 'sending', 'sent', 'failed'].includes(job.status))) throw new Error('Invalid scheduled updates');
+      }
       storageReady = true;
     } catch {
       console.error('Updates storage unavailable. Existing subscriber data was not overwritten.');
@@ -80,6 +90,42 @@ function registerUpdates(bot, channelLink, config = {}) {
     fs.writeFileSync(file + '.tmp', JSON.stringify([...next]), { mode: 0o600 });
     fs.renameSync(file + '.tmp', file);
     subscribers = next;
+  }
+  function saveJobs(next) {
+    fs.writeFileSync(jobsFile + '.tmp', JSON.stringify(next), { mode: 0o600 });
+    fs.renameSync(jobsFile + '.tmp', jobsFile);
+    jobs = next;
+  }
+  async function tick() {
+    if (!storageReady || ticking || busy) return;
+    ticking = true;
+    try {
+      for (const [id, job] of Object.entries(jobs)) {
+        if (job.status !== 'pending' || job.dueAt > now() || !subscribers.has(id)) continue;
+        // Persist before sending. A restart during an uncertain delivery must not duplicate it.
+        saveJobs({ ...jobs, [id]: { ...job, status: 'sending' } });
+        try {
+          await bot.sendMessage(id, '🔔 JORDAN AVIATOR ke latest updates ke liye hamara official channel join karein! 👇', {
+            disable_notification: false,
+            reply_markup: { inline_keyboard: [[{ text: '📢 Join Official Channel', url: channelLink }]] }
+          });
+          saveJobs({ ...jobs, [id]: { ...job, status: 'sent' } });
+          console.log('Automatic 10-minute update sent.');
+        } catch (error) {
+          const body = error.response && error.response.body;
+          if (body && body.error_code === 429) {
+            saveJobs({ ...jobs, [id]: { status: 'pending', dueAt: now() + (Number(body.parameters && body.parameters.retry_after) || 2) * 1000 + 1000 } });
+            break;
+          }
+          saveJobs({ ...jobs, [id]: { ...job, status: 'failed' } });
+          if (body && body.error_code === 403) {
+            const next = new Set(subscribers); next.delete(id); save(next);
+          }
+          console.warn('Automatic update delivery failed or could not be confirmed.');
+        }
+        await wait(1100);
+      }
+    } finally { ticking = false; }
   }
   const reply = (id, text) => bot.sendMessage(id, text).catch(() => {});
   function on(pattern, handler) {
@@ -96,6 +142,8 @@ function registerUpdates(bot, channelLink, config = {}) {
     const next = new Set(subscribers);
     next.add(String(msg.chat.id));
     save(next);
+    const id = String(msg.chat.id);
+    if (!jobs[id]) saveJobs({ ...jobs, [id]: { dueAt: now() + 10 * 60 * 1000, status: 'pending' } });
     return reply(msg.chat.id, '🔔 Updates ON. Notifications band karne ke liye /stop bhejein.');
   }
   on(/^\/(?:start|subscribe)(?:@\w+)?(?:\s.*)?$/s, subscribe);
@@ -105,6 +153,9 @@ function registerUpdates(bot, channelLink, config = {}) {
     const next = new Set(subscribers);
     next.delete(String(msg.chat.id));
     save(next);
+    // Keep the completed/cancelled marker so repeated /start commands cannot create duplicates.
+    const id = String(msg.chat.id);
+    if (jobs[id] && jobs[id].status === 'pending') saveJobs({ ...jobs, [id]: { ...jobs[id], status: 'failed' } });
     return reply(msg.chat.id, 'Updates OFF. Dobara shuru karne ke liye /subscribe bhejein.');
   });
   function isAdmin(msg) { return admins.has(String(msg.from.id)); }
@@ -117,7 +168,7 @@ function registerUpdates(bot, channelLink, config = {}) {
     if (!storageReady) return reply(msg.chat.id, 'Broadcast unavailable: persistent storage setup pending.');
     const text = (match[1] || '').trim();
     if (!text || text.length > 4096) return reply(msg.chat.id, 'Use: /broadcast aapka message\nMessage 1–4096 characters ka hona chahiye.');
-    if (busy) return reply(msg.chat.id, 'Ek broadcast already chal raha hai. Please wait.');
+    if (busy || ticking) return reply(msg.chat.id, 'Updates bheje ja rahe hain. Please kuch der baad try karein.');
     if (!subscribers.size) return reply(msg.chat.id, 'Abhi 0 subscribers hain. Users ko /start ya /subscribe bhejna hoga.');
     busy = true;
     let sent = 0, failed = 0, skipped = 0;
@@ -157,6 +208,12 @@ function registerUpdates(bot, channelLink, config = {}) {
     }
   });
   console.log('Updates module ready. Admin configured: ' + Boolean(admins.size) + '. Storage ready: ' + storageReady);
+  let timer;
+  if (config.autoTick !== false) {
+    timer = setInterval(() => tick().catch(error => console.error('Scheduled update error:', error.code || 'UNKNOWN')), 1000);
+    timer.unref();
+  }
+  return { tick, close: () => clearInterval(timer) };
 }
 
 registerUpdates(bot, CHANNEL_LINK);
